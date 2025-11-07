@@ -15,6 +15,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from pycocotools.coco import COCO
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
@@ -419,23 +420,37 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
+    # Currently using the 5k subset of COCO from Kaggle
+    coco_train = COCO("coco/annotations/instances_train2017.json")
+    cat_ids_train = coco_train.getCatIds()
+    cats_train = coco_train.loadCats(cat_ids_train)
+
+    class_names = [cat['name'] for cat in cats_train]
+    num_classes = len(class_names)
+    num_images_train = len(coco_train.getImgIds())
+    print("Number of classes:", num_classes)
+    # print("Classes:", class_names)
+    print("Number of images in train:", num_images_train)
+
+    coco_val = COCO("coco/annotations/instances_val2017.json")
+    num_images_val = len(coco_val.getImgIds())
+    print("Number of images in val:", num_images_val)
+
     # Hyperparameters
-    dataset_size = 1000 # Can adjust 
+    dataset_size = num_images_train
     batch_size = 2
     num_workers = 2
 
     # Train Dataset
-    train_root = "/coco/images/train"
-    train_annotations = "/coco/annotations/train.json"
+    train_root = "coco/train2017"
+    train_annotations = "coco/annotations/instances_train2017.json"
     train_dataset = CocoDetection(
         root=train_root,
         annFile=train_annotations,
         transform=get_transform(train=True)
     )
-    indices = list(range(dataset_size))
-    train_subset = Subset(train_dataset, indices)
     train_loader = DataLoader(
-        train_subset,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
@@ -443,15 +458,15 @@ if __name__ == "__main__":
     )
 
     # Test dataset
-    test_root = "/coco/images/test"
-    test_annotations = "/coco/annotations/test.json"
-    test_subset = CocoDetection(
-        root=test_root,
-        annFile=test_annotations,
+    val_root = "coco/val2017"
+    val_annotations = "coco/annotations/instances_val2017.json"
+    val_dataset = CocoDetection(
+        root=val_root,
+        annFile=val_annotations,
         transform=get_transform(train=False)
     )
     test_loader = DataLoader(
-        test_subset,
+        val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -459,7 +474,7 @@ if __name__ == "__main__":
     )
 
     # Instantiate model
-    model = DynamicDet(num_classes=91).to(device)
+    model = DynamicDet(num_classes=num_classes).to(device)
 
     backbone_epochs = 2
     router_epochs = 3
