@@ -5,16 +5,41 @@ from torchvision.models.detection import (
     fasterrcnn_mobilenet_v3_large_fpn,
     fasterrcnn_resnet50_fpn
 )
-
+import torch.optim as optim
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.ops import MultiScaleRoIAlign
-from torchvision import transforms
+from torchvision.datasets import CocoDetection
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms as T
 import time
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
 model that adapts its architecture based on input image complexity. 
 '''
+
+def replace_box_predictor(model, num_classes):
+    '''
+    Replace the box predictor to match the number of classes
+    '''
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
+
+def get_transform(train):
+    # Conver to tensor and randomly flip image horizontally
+    t = []
+    t.append(T.ToTensor())
+    if train:
+        t.append(T.RandomHorizontalFlip(0.5))
+    
+    return T.Compose(t)
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
 
 class Router(nn.Module):
     def __init__(self, in_channels, hidden):
@@ -42,21 +67,13 @@ class Router(nn.Module):
             pooled.append(p)
 
         # Concatenate features
-        concat = torch.stack(pooled, dim=0).mean(dim=0) # (B, C)
+        concat = torch.cat(pooled, dim=1) # (B, C)
 
         # Pass through Fully Connected layers
         output = self.fc(concat) # (B, 1)
         score = torch.sigmoid(output).squeeze(-1) # (B,)
 
         return score
-    
-def replace_box_predictor(model, num_classes):
-    '''
-    Replace the box predictor to match the number of classes
-    '''
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    return model
     
 '''
 This is the DynamicDet class with the 2 detectors.
@@ -68,25 +85,28 @@ class DynamicDet(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
         # Lightweight backbone (B1)
-        self.b1 = fasterrcnn_mobilenet_v3_large_fpn(pretrained=True)
+        self.b1 = fasterrcnn_mobilenet_v3_large_fpn(weights='DEFAULT')
         self.b1 = replace_box_predictor(self.b1, num_classes)
 
         # Heavy backbone (B2)
-        self.b2 = fasterrcnn_resnet50_fpn(pretrained=True)
+        self.b2 = fasterrcnn_resnet50_fpn(weights='DEFAULT')
         self.b2 = replace_box_predictor(self.b2, num_classes)
 
         # Router
-        self.router = Router(in_channels=256, hidden=256).to(device)
+        router_channels = 256 * 5
+        self.router = Router(in_channels=router_channels, hidden=256)
         self.threshold = 0.5 # Initial threshold for router
 
     def get_first_backbone_features(self, images):
+        if isinstance(images, list):
+            images = torch.stack([image for image in images])
         return self.b1.backbone(images)
     
     def forward(self, images, targets, train_router):
         '''
         Params:
             images: list[Tensor]
-            targets: list[dict]
+            targets: list[dict] or None
             train_routers: Boolean - Compute B1 & B2
         '''
         if self.training:
@@ -114,12 +134,12 @@ class DynamicDet(nn.Module):
                         per_loss_b1.append(l1.detach().cpu())
                         per_loss_b2.append(l2.detach().cpu())
                     
-                per_loss_b1 = torch.tensor(per_loss_b1, device=device)
-                per_loss_b2 = torch.tensor(per_loss_b2, device=device)
+                per_loss_b1 = torch.stack(per_loss_b1)
+                per_loss_b2 = torch.stack(per_loss_b2)
 
                 # 1 means go to B2, 0 means exit
                 margin = 0.1
-                routing_label = (per_loss_b2 + margin < per_loss_b1).float().to(device)
+                routing_label = (per_loss_b2 + margin < per_loss_b1).float()
 
                 features = self.get_first_backbone_features(images)
                 score = self.router(features)
@@ -132,27 +152,325 @@ class DynamicDet(nn.Module):
                 outputs["Router_Score"] = score.detach()
 
                 return outputs
-            else:
-                # Run B1 and return
-                features = self.get_first_backbone_features(images)
-                score = self.router(features)
-                detections = []
+        else:
+            # Run B1 and return
+            features = self.get_first_backbone_features(images)
+            score = self.router(features)
+            detections = []
 
-                for i, image in enumerate(images):
-                    score_i = score[i].item()
-                    if score_i < self.threshold:
-                        # Run B1 for image
-                        detection = self.b1([image])
-                        detections.append(detection[0])
-                    else:
-                        # Run B2 for image
-                        detection = self.b2([image])
-                        detections.append(detection[0])
+            for i, image in enumerate(images):
+                score_i = score[i].item()
+                if score_i < self.threshold:
+                    # Run B1 for image
+                    detection = self.b1([image])
+                    detections.append(detection[0])
+                else:
+                    # Run B2 for image
+                    detection = self.b2([image])
+                    detections.append(detection[0])
+            
+            return detections
+
+def train_backbones(model, train_loader, epochs):
+    # Train both backbones
+    params = [p for p in model.b1.parameters() if p.requires_grad] + \
+             [p for p in model.b2.parameters() if p.requires_grad]
+    optimizer = optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=1e-4)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for images, targets in train_loader:
+            images = list(image.to(device) for image in images)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            optimizer.zero_grad()
+            outputs = model(images, targets, train_router=True)
+
+            loss = outputs['Loss_Router']
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+
+        print(f"Epoch [{epoch + 1}/{epochs}] Loss: {total_loss / len(train_loader):.4f}")
+
+    print("Finished training backbones")
+
+    return model
+
+def train_router(model, train_loader, epochs):
+    # Train router
+    params = [p for p in model.router.parameters() if p.requires_grad]
+    optimizer = optim.Adam(params, lr=0.001)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            images = list(image.to(device) for image in images)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            optimizer.zero_grad()
+            outputs = model(images, targets, train_router=True)
+
+            loss = outputs['Loss_B1'] + outputs['Loss_B2']
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+            # Calculate routing accuracy
+            routing_pred = (outputs['Router_Score'] >= 0.5).float()
+            routing_label = outputs['Routing_Label']
+            correct = (routing_pred == routing_label).sum().item()
+            total_correct += correct
+            total_samples += len(routing_label)
+            
+            if batch_idx % 10 == 0:
+                print(f"Epoch [{epoch+1}/{epochs}] Batch [{batch_idx}/{len(train_loader)}] "
+                      f"Loss: {loss.item():.4f} Acc: {correct/len(routing_label):.2%}")
+        
+        avg_accuracy = total_correct / total_samples
+        print(f"Epoch [{epoch + 1}/{epochs}] Avg Loss: {total_loss / len(train_loader):.4f} "
+              f"Avg Accuracy: {avg_accuracy:.2%}")
+
+    return model
+
+def compute_iou(box1, box2):
+    x1_inter = max(box1[0], box2[0])
+    y1_inter = max(box1[1], box2[1])
+    x2_inter = min(box1[2], box2[2])
+    y2_inter = min(box1[3], box2[3])
+    
+    inter_area = max(0, x2_inter - x1_inter) * max(0, y2_inter - y1_inter)
+    
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    union_area = box1_area + box2_area - inter_area
+    
+    return inter_area / union_area if union_area > 0 else 0
+
+def visualize_detections(image_tensor, detections, save_path, confidence_threshold, 
+                        backbone_used, show_gt, gt_boxes, gt_labels):
+    # Convert tensor to numpy array
+    img_np = image_tensor.cpu().permute(1, 2, 0).numpy()
+    
+    # Denormalize if needed (assuming ImageNet normalization)
+    # If your images are already in [0,1], skip this
+    img_np = np.clip(img_np, 0, 1)
+    
+    fig, ax = plt.subplots(1, figsize=(12, 8))
+    ax.imshow(img_np)
+    
+    boxes = detections['boxes'].cpu()
+    labels = detections['labels'].cpu()
+    scores = detections['scores'].cpu()
+    
+    # Draw predictions
+    for box, label, score in zip(boxes, labels, scores):
+        if score > confidence_threshold:
+            x1, y1, x2, y2 = box
+            width = x2 - x1
+            height = y2 - y1
+            
+            # Create rectangle
+            rect = patches.Rectangle((x1, y1), width, height, 
+                                     linewidth=2, edgecolor='red', facecolor='none')
+            ax.add_patch(rect)
+            
+            # Add label
+            text = f'class_{label}: {score:.2f}'
+            ax.text(x1, y1 - 5, text, color='red', fontsize=10, 
+                   bbox=dict(facecolor='white', alpha=0.7, edgecolor='red'))
+    
+    # Draw ground truth boxes if requested
+    if show_gt and gt_boxes is not None:
+        gt_boxes_np = gt_boxes.cpu() if isinstance(gt_boxes, torch.Tensor) else gt_boxes
+        gt_labels_np = gt_labels.cpu() if isinstance(gt_labels, torch.Tensor) else gt_labels
+        
+        for box, label in zip(gt_boxes_np, gt_labels_np):
+            x1, y1, x2, y2 = box
+            width = x2 - x1
+            height = y2 - y1
+            
+            rect = patches.Rectangle((x1, y1), width, height, 
+                                     linewidth=2, edgecolor='green', 
+                                     facecolor='none', linestyle='--')
+            ax.add_patch(rect)
+            
+            ax.text(x1, y2 + 15, f'GT: class_{label}', color='green', 
+                   fontsize=9, bbox=dict(facecolor='white', alpha=0.7, edgecolor='green'))
+    
+    # Add title with backbone info
+    title = f'Detections (Backbone: {backbone_used})'
+    if show_gt:
+        title += ' | Red=Predictions, Green=Ground Truth'
+    ax.set_title(title, fontsize=14)
+    ax.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+def test(model, test_loader, confidence_threshold):
+    model.eval()
+    correct = 0
+    b1_count = 0
+    b2_count = 0
+    total = 0
+    os.makedirs("results", exist_ok=True)
+
+    with torch.no_grad():
+        for batch_idx, (images, targets) in enumerate(test_loader):
+            images = list(image.to(device) for image in images)
+
+            # Get routing decisions
+            features = model.get_first_backbone_features(images)
+            scores = model.router(features)
+
+            routing_decisions = []
+            for score in scores:
+                total += 1
+                if score.item() < model.threshold:
+                    b1_count += 1
+                    routing_decisions.append("B1")
+                else:
+                    b2_count += 1
+                    routing_decisions.append("B2")
+
+            detections = model(images, targets=None, train_router=False)
+
+            for img_idx, (image, detection, target, backbone) in enumerate(
+                zip(images, detections, targets, routing_decisions)
+            ):
+                boxes = detection['boxes']
+                labels = detection['labels']
+                det_scores = detection['scores']
                 
-                return detections
+                gt_boxes = target['boxes']
+                gt_labels = target['labels']
+                
+                # Filter detections by confidence
+                mask = det_scores > confidence_threshold
+                boxes = boxes[mask]
+                labels = labels[mask]
+                det_scores = det_scores[mask]
+                
+                # Calculate metrics (simplified - matches predictions to GT by IoU)
+                matched_gt = set()
+                for pred_box, pred_label in zip(boxes, labels):
+                    best_iou = 0
+                    best_gt_idx = -1
+                    
+                    # Find best matching GT box
+                    for gt_idx, (gt_box, gt_label) in enumerate(zip(gt_boxes, gt_labels)):
+                        if gt_label == pred_label: # Same class
+                            iou = compute_iou(pred_box, gt_box)
+                            if iou > best_iou:
+                                best_iou = iou
+                                best_gt_idx = gt_idx
+                    
+                    # Consider it a match if IoU > 0.5
+                    if best_iou > 0.5 and best_gt_idx not in matched_gt:
+                        total_tp += 1
+                        matched_gt.add(best_gt_idx)
+                    else:
+                        total_fp += 1
+                
+                total_gt += len(gt_boxes)
+                
+                # Save visualizations
+                if images_saved < 10:
+                    save_path = os.path.join(
+                        "detection_results", 
+                        f'batch{batch_idx}_img{img_idx}_{backbone}.png'
+                    )
+                    
+                    # Reconstruct detection dict for visualization
+                    vis_detection = {
+                        'boxes': boxes,
+                        'labels': labels,
+                        'scores': det_scores
+                    }
+                    
+                    visualize_detections(
+                        image, 
+                        vis_detection, 
+                        save_path,
+                        confidence_threshold=confidence_threshold,
+                        backbone_used=backbone,
+                        show_gt=True,
+                        gt_boxes=gt_boxes,
+                        gt_labels=gt_labels
+                    )
+                    images_saved += 1
+                    print(f"Saved visualization: {save_path}")
 
+    print(f"Routed to B1 (lightweight): {b1_count} ({b1_count/total:.1%})")
+    print(f"Routed to B2 (heavy): {b2_count} ({b2_count/total:.1%})")
+
+    print(f"Accuracy: {correct / total}")
 
 if __name__ == "__main__":
     start_time = time.time()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    # Hyperparameters
+    dataset_size = 1000 # Can adjust 
+    batch_size = 2
+    num_workers = 2
+
+    # Train Dataset
+    train_root = "/coco/images/train"
+    train_annotations = "/coco/annotations/train.json"
+    train_dataset = CocoDetection(
+        root=train_root,
+        annFile=train_annotations,
+        transform=get_transform(train=True)
+    )
+    indices = list(range(dataset_size))
+    train_subset = Subset(train_dataset, indices)
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
+
+    # Test dataset
+    test_root = "/coco/images/test"
+    test_annotations = "/coco/annotations/test.json"
+    test_subset = CocoDetection(
+        root=test_root,
+        annFile=test_annotations,
+        transform=get_transform(train=False)
+    )
+    test_loader = DataLoader(
+        test_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
+
+    # Instantiate model
+    model = DynamicDet(num_classes=91).to(device)
+
+    backbone_epochs = 2
+    router_epochs = 3
+    confidence_threshold = 0.5
+
+    # Train and Test
+    model = train_backbones(model, train_loader, backbone_epochs)
+    model = train_router(model, train_loader, router_epochs)
+    test(model, test_loader, confidence_threshold)
+
+    end_time = time.time()
+    minutes = (end_time - start_time) / 60
+    seconds = (end_time - start_time) % 60
+    print(f"Total time: {minutes:.0f} minutes {seconds:.2f} seconds")
