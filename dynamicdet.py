@@ -15,6 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image
+from pycocotools.coco import COCO
 from handling_data import process_dataset, get_annotation_info
 
 '''
@@ -51,10 +52,17 @@ def sanitize_boxes(targets):
     return targets
 
 class CocoDataset(Dataset):
-    def __init__(self, id_to_contiguous, contiguous_to_name, transforms):
-        self.id_to_contiguous = id_to_contiguous
-        self.contiguous_to_name = contiguous_to_name
-        self.transforms = transforms
+    def __init__(self, root, annotation, transform):
+        self.coco = COCO(annotation)
+        self.ids = list(sorted(self.coco.imgs.keys()))
+        self.root = root
+        self.transform = transform
+
+        # Make contiguous category mapping here
+        cat_ids = self.coco.getCatIds()
+        cats = self.coco.loadCats(cat_ids)
+        self.id_to_contiguous = {cat['id']: i + 1 for i, cat in enumerate(cats)}
+        self.contiguous_to_name = {i + 1: cat['name'] for i, cat in enumerate(cats)}
 
     def __getitem__(self, index):
         img_id = self.ids[index]
@@ -80,8 +88,8 @@ class CocoDataset(Dataset):
 
         target = {"boxes": boxes, "labels": labels}
 
-        if self.transforms:
-            img, target = self.transforms(img, target)
+        if self.transform:
+            img, target = self.transform(img, target)
 
         return img, target
 
@@ -468,7 +476,7 @@ if __name__ == "__main__":
 
     # Currently using the 5k subset of COCO from Kaggle
     train_path = "coco/annotations/instances_train2017.json"
-    num_classes, num_images_train, id_to_contiguous, contiguous_to_name = process_dataset(train_path)
+    num_classes, num_images_train = process_dataset(train_path)
     # get_annotation_info(train_path)
 
     # Hyperparameters
@@ -480,8 +488,8 @@ if __name__ == "__main__":
     train_root = "coco/train2017"
     train_annotations = "coco/annotations/instances_train2017.json"
     train_dataset = CocoDataset(
-        id_to_contiguous,
-        contiguous_to_name,
+        root=train_root,
+        annotation=train_annotations,
         transform=get_transform()
     )
     train_loader = DataLoader(
@@ -496,8 +504,8 @@ if __name__ == "__main__":
     val_root = "coco/val2017"
     val_annotations = "coco/annotations/instances_val2017.json"
     val_dataset = CocoDataset(
-        id_to_contiguous,
-        contiguous_to_name,
+        root=val_root,
+        annotation=val_annotations,
         transform=get_transform()
     )
     test_loader = DataLoader(

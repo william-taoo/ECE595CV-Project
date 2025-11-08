@@ -13,12 +13,7 @@ def process_dataset(path):
     # print("Classes:", class_names)
     # print("Number of images:", num_images)
 
-    id_to_contiguous = {cat['id']: i + 1 for i, cat in enumerate(cats)}
-    contiguous_to_name = {i + 1: cat['name'] for i, cat in enumerate(cats)}
-
-    # print("Dataset categories:", contiguous_to_name)
-
-    return num_classes, num_images, id_to_contiguous, contiguous_to_name
+    return num_classes, num_images
 
 def get_annotation_info(path):
     with open(path) as f:
