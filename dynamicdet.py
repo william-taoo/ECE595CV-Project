@@ -89,7 +89,7 @@ class CocoDataset(Dataset):
         target = {"boxes": boxes, "labels": labels}
 
         if self.transform:
-            img, target = self.transform(img, target)
+            img = self.transform(img)
 
         return img, target
 
@@ -153,7 +153,23 @@ class DynamicDet(nn.Module):
         self.threshold = 0.5 # Initial threshold for router
 
     def get_first_backbone_features(self, images):
-        return self.b1.backbone(images)
+        # Each image is a tensor [3, H, W]
+        features_list = []
+
+        for img in images:
+            # Add batch dimension: [1, 3, H, W]
+            with torch.no_grad():
+                feats = self.b1.backbone(img.unsqueeze(0)) # Dict[str, Tensor]
+                # Concatenate all FPN outputs into one flattened feature vector
+                concat_feats = torch.cat(
+                    [f.flatten(1).mean(1, keepdim=True) for f in feats.values()],
+                    dim=1
+                )
+                features_list.append(concat_feats)
+
+        # Stack into [B, router_channels]
+        features = torch.cat(features_list, dim=0)
+        return features
     
     def forward(self, images, targets, train_router):
         '''
