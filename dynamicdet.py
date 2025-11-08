@@ -7,15 +7,15 @@ from torchvision.models.detection import (
 )
 import torch.optim as optim
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.datasets import CocoDetection
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
 import time
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from pycocotools.coco import COCO
+from PIL import Image
+from handling_data import process_dataset, get_annotation_info
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
@@ -27,20 +27,66 @@ def replace_box_predictor(model, num_classes):
     Replace the box predictor to match the number of classes
     '''
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes + 1) # +1 for background
     return model
 
-def get_transform(train):
-    # Conver to tensor and randomly flip image horizontally
+def get_transform():
+    # Conver to tensor
     t = []
     t.append(T.ToTensor())
-    if train:
-        t.append(T.RandomHorizontalFlip(0.5))
-    
     return T.Compose(t)
 
 def collate_fn(batch):
     return tuple(zip(*batch))
+
+def sanitize_boxes(targets):
+    for t in targets:
+        boxes = t["boxes"]
+        # Ensure all boxes are in [xmin, ymin, xmax, ymax] order
+        xmin = torch.min(boxes[:, 0], boxes[:, 2])
+        ymin = torch.min(boxes[:, 1], boxes[:, 3])
+        xmax = torch.max(boxes[:, 0], boxes[:, 2])
+        ymax = torch.max(boxes[:, 1], boxes[:, 3])
+        t["boxes"] = torch.stack([xmin, ymin, xmax, ymax], dim=1)
+    return targets
+
+class CocoDataset(Dataset):
+    def __init__(self, id_to_contiguous, contiguous_to_name, transforms):
+        self.id_to_contiguous = id_to_contiguous
+        self.contiguous_to_name = contiguous_to_name
+        self.transforms = transforms
+
+    def __getitem__(self, index):
+        img_id = self.ids[index]
+        ann_ids = self.coco.getAnnIds(imgIds=img_id)
+        anns = self.coco.loadAnns(ann_ids)
+
+        path = self.coco.loadImgs(img_id)[0]['file_name']
+        img = Image.open(os.path.join(self.root, path)).convert("RGB")
+
+        boxes = []
+        labels = []
+        for obj in anns:
+            xmin, ymin, w, h = obj['bbox']
+            if w <= 0 or h <= 0: # skip invalid boxes
+                continue
+            boxes.append([xmin, ymin, xmin + w, ymin + h])
+
+            # Remap categories
+            labels.append(self.id_to_contiguous[obj['category_id']])
+
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(labels, dtype=torch.int64)
+
+        target = {"boxes": boxes, "labels": labels}
+
+        if self.transforms:
+            img, target = self.transforms(img, target)
+
+        return img, target
+
+    def __len__(self):
+        return len(self.ids)
 
 class Router(nn.Module):
     def __init__(self, in_channels, hidden):
@@ -99,8 +145,6 @@ class DynamicDet(nn.Module):
         self.threshold = 0.5 # Initial threshold for router
 
     def get_first_backbone_features(self, images):
-        if isinstance(images, list):
-            images = torch.stack([image for image in images])
         return self.b1.backbone(images)
     
     def forward(self, images, targets, train_router):
@@ -183,6 +227,7 @@ def train_backbones(model, train_loader, epochs):
         total_loss = 0.0
         for images, targets in train_loader:
             images = list(image.to(device) for image in images)
+            targets = sanitize_boxes(targets)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             optimizer.zero_grad()
@@ -210,6 +255,7 @@ def train_router(model, train_loader, epochs):
         total_loss = 0.0
         for batch_idx, (images, targets) in enumerate(train_loader):
             images = list(image.to(device) for image in images)
+            targets = sanitize_boxes(targets)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             optimizer.zero_grad()
@@ -421,20 +467,9 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     # Currently using the 5k subset of COCO from Kaggle
-    coco_train = COCO("coco/annotations/instances_train2017.json")
-    cat_ids_train = coco_train.getCatIds()
-    cats_train = coco_train.loadCats(cat_ids_train)
-
-    class_names = [cat['name'] for cat in cats_train]
-    num_classes = len(class_names)
-    num_images_train = len(coco_train.getImgIds())
-    print("Number of classes:", num_classes)
-    # print("Classes:", class_names)
-    print("Number of images in train:", num_images_train)
-
-    coco_val = COCO("coco/annotations/instances_val2017.json")
-    num_images_val = len(coco_val.getImgIds())
-    print("Number of images in val:", num_images_val)
+    train_path = "coco/annotations/instances_train2017.json"
+    num_classes, num_images_train, id_to_contiguous, contiguous_to_name = process_dataset(train_path)
+    # get_annotation_info(train_path)
 
     # Hyperparameters
     dataset_size = num_images_train
@@ -444,10 +479,10 @@ if __name__ == "__main__":
     # Train Dataset
     train_root = "coco/train2017"
     train_annotations = "coco/annotations/instances_train2017.json"
-    train_dataset = CocoDetection(
-        root=train_root,
-        annFile=train_annotations,
-        transform=get_transform(train=True)
+    train_dataset = CocoDataset(
+        id_to_contiguous,
+        contiguous_to_name,
+        transform=get_transform()
     )
     train_loader = DataLoader(
         train_dataset,
@@ -460,10 +495,10 @@ if __name__ == "__main__":
     # Test dataset
     val_root = "coco/val2017"
     val_annotations = "coco/annotations/instances_val2017.json"
-    val_dataset = CocoDetection(
-        root=val_root,
-        annFile=val_annotations,
-        transform=get_transform(train=False)
+    val_dataset = CocoDataset(
+        id_to_contiguous,
+        contiguous_to_name,
+        transform=get_transform()
     )
     test_loader = DataLoader(
         val_dataset,
