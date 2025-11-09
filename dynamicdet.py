@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image
 from pycocotools.coco import COCO
-from handling_data import process_dataset, get_annotation_info
+from handling_data import process_dataset, get_annotation_info, split_dataset
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
@@ -43,6 +43,9 @@ def collate_fn(batch):
 def sanitize_boxes(targets):
     for t in targets:
         boxes = t["boxes"]
+        if len(boxes) == 0:
+            continue
+
         # Ensure all boxes are in [xmin, ymin, xmax, ymax] order
         xmin = torch.min(boxes[:, 0], boxes[:, 2])
         ymin = torch.min(boxes[:, 1], boxes[:, 3])
@@ -76,7 +79,7 @@ class CocoDataset(Dataset):
         labels = []
         for obj in anns:
             xmin, ymin, w, h = obj['bbox']
-            if w <= 0 or h <= 0: # skip invalid boxes
+            if w <= 0 or h <= 0: # Skip invalid boxes
                 continue
             boxes.append([xmin, ymin, xmin + w, ymin + h])
 
@@ -99,36 +102,16 @@ class CocoDataset(Dataset):
 class Router(nn.Module):
     def __init__(self, in_channels, hidden):
         super().__init__()
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 1) # Predicted score
-        )
+        self.fc1 = nn.Linear(in_channels, hidden)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden, 1) # Predicted Score
+        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, features):
-        '''
-        features: dict or list of tensors from FPN
-        We want to flatten the average pooled features
-        '''
-        pooled = []
-
-        if isinstance(features, dict):
-            features = list(features.values())
-        
-        # First pool the features
-        for feat in features:
-            p = self.pool(feat).view(feat.size(0), -1) # (B, C)
-            pooled.append(p)
-
-        # Concatenate features
-        concat = torch.cat(pooled, dim=1) # (B, C)
-
-        # Pass through Fully Connected layers
-        output = self.fc(concat) # (B, 1)
-        score = torch.sigmoid(output).squeeze(-1) # (B,)
-
-        return score
+    def forward(self, x):
+        # x: [B, in_channels]
+        x = self.relu(self.fc1(x))
+        x = self.sigmoid(self.fc2(x))
+        return x.view(-1, 1) # Output shape [B, 1]
     
 '''
 This is the DynamicDet class with the 2 detectors.
@@ -148,8 +131,8 @@ class DynamicDet(nn.Module):
         self.b2 = replace_box_predictor(self.b2, num_classes)
 
         # Router
-        router_channels = 256 * 5
-        self.router = Router(in_channels=router_channels, hidden=256)
+        self.router = Router(in_channels=256, hidden=128)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.threshold = 0.5 # Initial threshold for router
 
     def get_first_backbone_features(self, images):
@@ -160,12 +143,12 @@ class DynamicDet(nn.Module):
             # Add batch dimension: [1, 3, H, W]
             with torch.no_grad():
                 feats = self.b1.backbone(img.unsqueeze(0)) # Dict[str, Tensor]
-                # Concatenate all FPN outputs into one flattened feature vector
-                concat_feats = torch.cat(
-                    [f.flatten(1).mean(1, keepdim=True) for f in feats.values()],
-                    dim=1
-                )
-                features_list.append(concat_feats)
+                feat_key = list(feats.keys())[-1]
+                feat_map = feats[feat_key] # Shape: [1, C, H, W]
+                
+                # Apply adaptive pooling to get fixed size
+                pooled = self.adaptive_pool(feat_map) # [1, C, 1, 1]
+                features_list.append(pooled.squeeze()) # [C]
 
         # Stack into [B, router_channels]
         features = torch.cat(features_list, dim=0)
@@ -219,8 +202,9 @@ class DynamicDet(nn.Module):
                 outputs["Loss_Router"] = bce
                 outputs["Router"] = routing_label
                 outputs["Router_Score"] = score.detach()
-
-                return outputs
+            
+            print(f"Outputs: {outputs}")
+            return outputs
         else:
             # Run B1 and return
             features = self.get_first_backbone_features(images)
@@ -255,9 +239,9 @@ def train_backbones(model, train_loader, epochs):
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             optimizer.zero_grad()
-            outputs = model(images, targets, train_router=True)
+            outputs = model(images, targets, train_router=False)
 
-            loss = outputs['Loss_Router']
+            loss = outputs['Loss_B1'] + outputs['Loss_B2']
             loss.backward()
             optimizer.step()
             
@@ -277,7 +261,7 @@ def train_router(model, train_loader, epochs):
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
-        for batch_idx, (images, targets) in enumerate(train_loader):
+        for images, targets in train_loader:
             images = list(image.to(device) for image in images)
             targets = sanitize_boxes(targets)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -285,7 +269,7 @@ def train_router(model, train_loader, epochs):
             optimizer.zero_grad()
             outputs = model(images, targets, train_router=True)
 
-            loss = outputs['Loss_B1'] + outputs['Loss_B2']
+            loss = outputs['Loss_Router']
             loss.backward()
             optimizer.step()
             
@@ -297,10 +281,6 @@ def train_router(model, train_loader, epochs):
             correct = (routing_pred == routing_label).sum().item()
             total_correct += correct
             total_samples += len(routing_label)
-            
-            if batch_idx % 10 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Batch [{batch_idx}/{len(train_loader)}] "
-                      f"Loss: {loss.item():.4f} Acc: {correct/len(routing_label):.2%}")
         
         avg_accuracy = total_correct / total_samples
         print(f"Epoch [{epoch + 1}/{epochs}] Avg Loss: {total_loss / len(train_loader):.4f} "
@@ -491,18 +471,30 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     # Currently using the 5k subset of COCO from Kaggle
-    train_path = "coco/annotations/instances_train2017.json"
-    num_classes, num_images_train = process_dataset(train_path)
+    subset_size = 100 # Use smaller portion
+    split_annotations_path = "coco/annotations/instances_train2017.json"
+
+    # Split dataset into smaller train/val subsets if not already done
+    train_subset_path = f"coco/annotations/instances_train2017_{subset_size}.json"
+    val_subset_path = f"coco/annotations/instances_val2017_{subset_size}.json"
+
+    if not (os.path.exists(train_subset_path) and os.path.exists(val_subset_path)):
+        print(f"Creating reduced dataset of {subset_size} images...")
+        split_dataset(split_annotations_path, size=subset_size)
+    else:
+        print(f"Subset already exists for {subset_size} images.")
+
+    # train_path = "coco/annotations/instances_train2017.json"
+    num_classes, num_images_train = process_dataset(train_subset_path)
     # get_annotation_info(train_path)
 
     # Hyperparameters
-    dataset_size = num_images_train
-    batch_size = 2
+    batch_size = 10
     num_workers = 2
 
     # Train Dataset
-    train_root = "coco/train2017"
-    train_annotations = "coco/annotations/instances_train2017.json"
+    train_root = f"coco/train2017_{subset_size}"
+    train_annotations = train_subset_path
     train_dataset = CocoDataset(
         root=train_root,
         annotation=train_annotations,
@@ -517,8 +509,8 @@ if __name__ == "__main__":
     )
 
     # Test dataset
-    val_root = "coco/val2017"
-    val_annotations = "coco/annotations/instances_val2017.json"
+    val_root = f"coco/val2017_{subset_size}"
+    val_annotations = val_subset_path
     val_dataset = CocoDataset(
         root=val_root,
         annotation=val_annotations,
@@ -536,7 +528,7 @@ if __name__ == "__main__":
     model = DynamicDet(num_classes=num_classes).to(device)
 
     backbone_epochs = 2
-    router_epochs = 3
+    router_epochs = 2
     confidence_threshold = 0.5
 
     # Train and Test
