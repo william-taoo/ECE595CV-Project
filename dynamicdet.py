@@ -16,7 +16,12 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from PIL import Image
 from pycocotools.coco import COCO
-from handling_data import process_dataset, get_annotation_info, split_dataset
+from handling_data import (
+    process_dataset, 
+    get_annotation_info, 
+    split_dataset,
+    COCO_CLASSES
+)
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
@@ -109,6 +114,8 @@ class Router(nn.Module):
 
     def forward(self, x):
         # x: [B, in_channels]
+        if x.ndim > 2:
+            x = torch.flatten(x, start_dim=1)
         x = self.relu(self.fc1(x))
         x = self.sigmoid(self.fc2(x))
         return x.view(-1, 1) # Output shape [B, 1]
@@ -130,28 +137,47 @@ class DynamicDet(nn.Module):
         self.b2 = fasterrcnn_resnet50_fpn(weights='DEFAULT')
         self.b2 = replace_box_predictor(self.b2, num_classes)
 
+        # Determine feature size from B1 backbone
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
+        dummy_input = torch.zeros(1, 3, 224, 224)
+        with torch.no_grad():
+            feats = self.b1.backbone(dummy_input)
+            concat_feats = []
+            for feat_map in feats.values():
+                pooled = self.adaptive_pool(feat_map)
+                concat_feats.append(pooled.squeeze())
+            combined = torch.cat(concat_feats, dim=0)
+            feature_size = combined.shape[0]
+        
+        print(f"Router input feature size: {feature_size}")
+
         # Router
-        self.router = Router(in_channels=256, hidden=128)
+        self.router = Router(in_channels=feature_size, hidden=256)
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         self.threshold = 0.5 # Initial threshold for router
 
     def get_first_backbone_features(self, images):
-        # Each image is a tensor [3, H, W]
+        # Extract features from B1 backbone
         features_list = []
 
-        for img in images:
-            # Add batch dimension: [1, 3, H, W]
-            with torch.no_grad():
+        with torch.no_grad():
+            for img in images:
+                # Add batch dimension: [1, 3, H, W]
                 feats = self.b1.backbone(img.unsqueeze(0)) # Dict[str, Tensor]
-                feat_key = list(feats.keys())[-1]
-                feat_map = feats[feat_key] # Shape: [1, C, H, W]
                 
-                # Apply adaptive pooling to get fixed size
-                pooled = self.adaptive_pool(feat_map) # [1, C, 1, 1]
-                features_list.append(pooled.squeeze()) # [C]
+                # Concatenate all FPN level features
+                concat_feats = []
+                for feat_map in feats.values():
+                    # Apply adaptive pooling to each feature map
+                    pooled = self.adaptive_pool(feat_map) # [1, C, 1, 1]
+                    concat_feats.append(pooled.squeeze()) # [C]
+                
+                # Concatenate features from all FPN levels
+                combined = torch.cat(concat_feats, dim=0) # [total_C]
+                features_list.append(combined)
 
-        # Stack into [B, router_channels]
-        features = torch.cat(features_list, dim=0)
+        # Stack into [B, total_C]
+        features = torch.stack(features_list, dim=0)
         return features
     
     def forward(self, images, targets, train_router):
@@ -192,9 +218,11 @@ class DynamicDet(nn.Module):
                 # 1 means go to B2, 0 means exit
                 margin = 0.1
                 routing_label = (per_loss_b2 + margin < per_loss_b1).float()
+                routing_label = routing_label.view(-1, 1)
 
                 features = self.get_first_backbone_features(images)
                 score = self.router(features)
+                # print("Router output shape:", score.shape)
 
                 # BCE loss
                 bce = F.binary_cross_entropy(score, routing_label)
@@ -203,7 +231,7 @@ class DynamicDet(nn.Module):
                 outputs["Router"] = routing_label
                 outputs["Router_Score"] = score.detach()
             
-            print(f"Outputs: {outputs}")
+            # print(f"Outputs: {outputs}")
             return outputs
         else:
             # Run B1 and return
@@ -261,6 +289,8 @@ def train_router(model, train_loader, epochs):
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
         for images, targets in train_loader:
             images = list(image.to(device) for image in images)
             targets = sanitize_boxes(targets)
@@ -277,7 +307,7 @@ def train_router(model, train_loader, epochs):
         
             # Calculate routing accuracy
             routing_pred = (outputs['Router_Score'] >= 0.5).float()
-            routing_label = outputs['Routing_Label']
+            routing_label = outputs['Router']
             correct = (routing_pred == routing_label).sum().item()
             total_correct += correct
             total_samples += len(routing_label)
@@ -332,7 +362,8 @@ def visualize_detections(image_tensor, detections, save_path, confidence_thresho
             ax.add_patch(rect)
             
             # Add label
-            text = f'class_{label}: {score:.2f}'
+            class_name = COCO_CLASSES.get(int(label), f'class_{label}')
+            text = f'{class_name}: {score:.2f}'
             ax.text(x1, y1 - 5, text, color='red', fontsize=10, 
                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='red'))
     
@@ -351,7 +382,7 @@ def visualize_detections(image_tensor, detections, save_path, confidence_thresho
                                      facecolor='none', linestyle='--')
             ax.add_patch(rect)
             
-            ax.text(x1, y2 + 15, f'GT: class_{label}', color='green', 
+            ax.text(x1, y2 + 15, f'GT: {class_name}', color='green', 
                    fontsize=9, bbox=dict(facecolor='white', alpha=0.7, edgecolor='green'))
     
     # Add title with backbone info
@@ -371,6 +402,10 @@ def test(model, test_loader, confidence_threshold):
     b1_count = 0
     b2_count = 0
     total = 0
+    total_tp = 0
+    total_fp = 0
+    total_gt = 0
+    images_saved = 0
     os.makedirs("results", exist_ok=True)
 
     with torch.no_grad():
@@ -392,6 +427,7 @@ def test(model, test_loader, confidence_threshold):
                     routing_decisions.append("B2")
 
             detections = model(images, targets=None, train_router=False)
+            print("Detection output example:", detections[0])
 
             for img_idx, (image, detection, target, backbone) in enumerate(
                 zip(images, detections, targets, routing_decisions)
@@ -433,9 +469,9 @@ def test(model, test_loader, confidence_threshold):
                 total_gt += len(gt_boxes)
                 
                 # Save visualizations
-                if images_saved < 10:
+                if images_saved < 50:
                     save_path = os.path.join(
-                        "detection_results", 
+                        "results", 
                         f'batch{batch_idx}_img{img_idx}_{backbone}.png'
                     )
                     
@@ -462,6 +498,14 @@ def test(model, test_loader, confidence_threshold):
     print(f"Routed to B1 (lightweight): {b1_count} ({b1_count/total:.1%})")
     print(f"Routed to B2 (heavy): {b2_count} ({b2_count/total:.1%})")
 
+    # Calculate metrics
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    recall = total_tp / total_gt if total_gt > 0 else 0
+    
+    print(f"\nDetection Metrics:")
+    print(f"Precision: {precision:.3f}")
+    print(f"Recall: {recall:.3f}")
+    print(f"F1 Score: {2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0:.3f}")
     print(f"Accuracy: {correct / total}")
 
 if __name__ == "__main__":
@@ -489,54 +533,69 @@ if __name__ == "__main__":
     # get_annotation_info(train_path)
 
     # Hyperparameters
-    batch_size = 10
-    num_workers = 2
+    # batch_size = 10
+    # num_workers = 2
 
-    # Train Dataset
-    train_root = f"coco/train2017_{subset_size}"
-    train_annotations = train_subset_path
-    train_dataset = CocoDataset(
-        root=train_root,
-        annotation=train_annotations,
-        transform=get_transform()
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
+    # # Train Dataset
+    # train_root = f"coco/train2017_{subset_size}"
+    # train_annotations = train_subset_path
+    # train_dataset = CocoDataset(
+    #     root=train_root,
+    #     annotation=train_annotations,
+    #     transform=get_transform()
+    # )
+    # train_loader = DataLoader(
+    #     train_dataset,
+    #     batch_size=batch_size,
+    #     shuffle=True,
+    #     num_workers=num_workers,
+    #     collate_fn=collate_fn
+    # )
 
-    # Test dataset
-    val_root = f"coco/val2017_{subset_size}"
-    val_annotations = val_subset_path
-    val_dataset = CocoDataset(
-        root=val_root,
-        annotation=val_annotations,
-        transform=get_transform()
-    )
-    test_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_fn
-    )
+    # # Test dataset
+    # val_root = f"coco/val2017_{subset_size}"
+    # val_annotations = val_subset_path
+    # val_dataset = CocoDataset(
+    #     root=val_root,
+    #     annotation=val_annotations,
+    #     transform=get_transform()
+    # )
+    # test_loader = DataLoader(
+    #     val_dataset,
+    #     batch_size=batch_size,
+    #     shuffle=False,
+    #     num_workers=num_workers,
+    #     collate_fn=collate_fn
+    # )
 
-    # Instantiate model
-    model = DynamicDet(num_classes=num_classes).to(device)
+    # # Instantiate model
+    # model = DynamicDet(num_classes=num_classes).to(device)
 
-    backbone_epochs = 2
-    router_epochs = 2
-    confidence_threshold = 0.5
+    # backbone_epochs = 2
+    # router_epochs = 2
+    # confidence_threshold = 0.1
 
-    # Train and Test
-    model = train_backbones(model, train_loader, backbone_epochs)
-    model = train_router(model, train_loader, router_epochs)
-    test(model, test_loader, confidence_threshold)
+    # # Train and Test
 
-    end_time = time.time()
-    minutes = (end_time - start_time) / 60
-    seconds = (end_time - start_time) % 60
-    print(f"Total time: {minutes:.0f} minutes {seconds:.2f} seconds")
+    # # train_backbone_start = time.time()
+    # # model = train_backbones(model, train_loader, backbone_epochs)
+    # # train_backbone_end = time.time()
+    # # train_backbone_time = train_backbone_end - train_backbone_start
+    # # print(f"Backbone training time: {train_backbone_time:.2f} seconds")
+
+    # model.b1.eval()
+    # model.b2.eval()
+
+    # train_router_start = time.time()
+    # model = train_router(model, train_loader, router_epochs)
+    # train_router_end = time.time()
+    # train_router_minutes = (train_router_end - train_router_start) / 60
+    # train_router_seconds = (train_router_end - train_router_start) % 60
+    # print(f"Router training time: {train_router_minutes:.0f} minutes {train_router_seconds:.2f} seconds")
+
+    # test(model, test_loader, confidence_threshold)
+
+    # end_time = time.time()
+    # minutes = (end_time - start_time) / 60
+    # seconds = (end_time - start_time) % 60
+    # print(f"Total time: {minutes:.0f} minutes {seconds:.2f} seconds")
