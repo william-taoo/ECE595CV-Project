@@ -23,6 +23,7 @@ from handling_data import (
     COCO_CLASSES
 )
 from ultralytics import YOLO
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
@@ -409,7 +410,6 @@ def visualize_detections(image_tensor, detections, save_path, confidence_thresho
 
 def test(model, test_loader, confidence_threshold):
     model.eval()
-    correct = 0
     b1_count = 0
     b2_count = 0
     total = 0
@@ -419,9 +419,15 @@ def test(model, test_loader, confidence_threshold):
     images_saved = 0
     os.makedirs("results/dynamic", exist_ok=True)
 
+    times = []
+    ap_metric = MeanAveragePrecision()
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(test_loader):
             images = list(image.to(device) for image in images)
+
+            # Time for inference
+            torch.cuda.synchronize()
+            start = time.time()
 
             # Get routing decisions
             features = model.get_first_backbone_features(images)
@@ -439,6 +445,11 @@ def test(model, test_loader, confidence_threshold):
 
             detections = model(images, targets=None, train_router=False)
             # print("Detection output example:", detections[0])
+
+            # Finish timing and append
+            torch.cuda.synchronize()
+            end = time.time()
+            times.append((end - start) * 1000) # ms
 
             for img_idx, (image, detection, target, backbone) in enumerate(
                 zip(images, detections, targets, routing_decisions)
@@ -460,6 +471,18 @@ def test(model, test_loader, confidence_threshold):
                 boxes = det_boxes[mask]
                 labels = det_labels[mask]
                 det_scores = det_scores[mask]
+
+                # Update mAP metric
+                pred = [{
+                    "boxes": boxes.detach().cpu(),
+                    "scores": det_scores.detach().cpu(),
+                    "labels": labels.detach().cpu(),
+                }]
+                target_data = [{
+                    "boxes": gt_boxes.detach().cpu(),
+                    "labels": gt_labels.detach().cpu(),
+                }]
+                ap_metric.update(pred, target_data)
                 
                 # Calculate metrics (simplified - matches predictions to GT by IoU)
                 matched_gt = set()
@@ -475,8 +498,8 @@ def test(model, test_loader, confidence_threshold):
                                 best_iou = iou
                                 best_gt_idx = gt_idx
                     
-                    # Consider it a match if IoU > 0.5
-                    if best_iou > 0.5 and best_gt_idx not in matched_gt:
+                    # Match IOU
+                    if best_iou > 0.3 and best_gt_idx not in matched_gt:
                         total_tp += 1
                         matched_gt.add(best_gt_idx)
                     else:
@@ -518,30 +541,80 @@ def test(model, test_loader, confidence_threshold):
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
     recall = total_tp / total_gt if total_gt > 0 else 0
     f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
     print(f"\nDetection Metrics:")
     print(f"Precision: {precision:.3f}")
     print(f"Recall: {recall:.3f}")
     print(f"F1 Score: {f1_score:.3f}")
 
-    return precision, recall, f1_score
+    # Compute mAP metrics
+    map_results = ap_metric.compute()
+    print("\nmAP Results:")
+    for k, v in map_results.items():
+        if torch.is_tensor(v):
+            v = v.item()
+        print(f"{k}: {v:.4f}")
 
-def test_comparison(model, test_loader, confidence_threshold):
+    avg_time = np.mean(times)
+    p95_time = np.percentile(times, 95)
+    fps = 1000 / avg_time
+    print(f"Average inference time: {avg_time:.2f} ms/image")
+    print(f"95th percentile latency: {p95_time:.2f} ms")
+    print(f"FPS: {fps:.2f}")
+
+    return precision, recall, f1_score, avg_time, p95_time, fps
+
+def train_individual(model, train_loader, epochs):
+    model.to(device)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=1e-4)
+
+    model.train()
+    for epoch in epochs:
+        total_loss = 0.0
+        for images, targets in train_loader:
+            images = [img.to(device) for img in images]
+            targets = sanitize_boxes(targets)
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            optimizer.zero_grad()
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+
+            losses.backward()
+            optimizer.step()
+
+            total_loss += losses.item()
+
+        print(f"\nEpoch [{epoch+1}/{epochs}]. Avg loss: {total_loss / len(train_loader):.4f}")
+
+    print("Finished training individual model")
+
+    return model
+
+def test_individual(model, test_loader, confidence_threshold, model_type):
     model.eval()
     total_tp = 0
     total_fp = 0
     total_gt = 0
     images_saved = 0
-    os.makedirs("results/compare", exist_ok=True)
+    os.makedirs(f"results/{model_type}", exist_ok=True)
 
+    times = []
+    ap_metric = MeanAveragePrecision()
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(test_loader):
             images = list(image.to(device) for image in images)
+            images_np = [img.permute(1, 2, 0).cpu().numpy() for img in images]
 
-            # Run YOLO inference
-            detections = model(images)
+            # Run individual model
+            torch.cuda.synchronize()
+            start = time.time()
+            detections = model(images_np)
+            torch.cuda.synchronize()
+            end = time.time()
+            times.append((end - start) * 1000)
 
-            # Convert YOLO output to consistent dict format
+            # Convert output to consistent dict format
             for img_idx, (image, detection, target) in enumerate(zip(images, detections, targets)):
                 if hasattr(detection, "boxes"):
                     det_boxes = detection.boxes.xyxy.to(device)
@@ -561,6 +634,17 @@ def test_comparison(model, test_loader, confidence_threshold):
                 det_labels = det_labels[mask]
                 det_scores = det_scores[mask]
 
+                preds = [{
+                    "boxes": det_boxes,
+                    "scores": det_scores,
+                    "labels": det_labels
+                }]
+                gts = [{
+                    "boxes": gt_boxes,
+                    "labels": gt_labels
+                }]
+                ap_metric.update(preds, gts)
+
                 # Calculate metrics (IoU-based)
                 matched_gt = set()
                 for pred_box, pred_label in zip(det_boxes, det_labels):
@@ -574,7 +658,7 @@ def test_comparison(model, test_loader, confidence_threshold):
                                 best_iou = iou
                                 best_gt_idx = gt_idx
 
-                    if best_iou > 0.5 and best_gt_idx not in matched_gt:
+                    if best_iou > 0.3 and best_gt_idx not in matched_gt:
                         total_tp += 1
                         matched_gt.add(best_gt_idx)
                     else:
@@ -586,7 +670,7 @@ def test_comparison(model, test_loader, confidence_threshold):
                 if images_saved < 50:
                     save_path = os.path.join(
                         "results/compare",
-                        f"batch{batch_idx}_img{img_idx}_YOLO.png"
+                        f"batch{batch_idx}_img{img_idx}_{model_type}.png"
                     )
 
                     vis_detection = {
@@ -600,24 +684,39 @@ def test_comparison(model, test_loader, confidence_threshold):
                         vis_detection,
                         save_path,
                         confidence_threshold=confidence_threshold,
-                        backbone_used="YOLO",
+                        backbone_used=model_type,
                         show_gt=True,
                         gt_boxes=gt_boxes,
                         gt_labels=gt_labels
                     )
                     images_saved += 1
 
-    # Compute metrics
+    # Compute summary metrics
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
     recall = total_tp / total_gt if total_gt > 0 else 0
     f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
 
-    print(f"\nYOLO Detection Metrics:")
+    avg_time = np.mean(times)
+    p95_time = np.percentile(times, 95)
+    fps = 1000 / avg_time
+    metrics = ap_metric.compute()
+
+    print(f"\n{model_type} Detection Metrics:")
     print(f"Precision: {precision:.3f}")
     print(f"Recall: {recall:.3f}")
     print(f"F1 Score: {f1_score:.3f}")
+    print(f"\nInference Speed:")
+    print(f"Average inference time: {avg_time:.2f} ms/image")
+    print(f"95th percentile latency: {p95_time:.2f} ms")
+    print(f"FPS: {fps:.2f}")
 
-    return precision, recall, f1_score
+    print(f"\nMean Average Precision (mAP):")
+    for k, v in metrics.items():
+        if torch.is_tensor(v):
+            v = v.item()
+        print(f"{k}: {v:.4f}")
+
+    return precision, recall, f1_score, metrics, avg_time, fps
 
 if __name__ == "__main__":
     start_time = time.time()
@@ -684,7 +783,7 @@ if __name__ == "__main__":
 
     backbone_epochs = 20
     router_epochs = 10
-    confidence_threshold = 0.1
+    confidence_threshold = 0.25
 
     # Train and Test
 
@@ -708,9 +807,27 @@ if __name__ == "__main__":
     model.router.eval()
     model_precision, model_recall, model_f1 = test(model, test_loader, confidence_threshold)
 
-    # Compare with YOLO model
-    compare_model = YOLO("yolo11n.pt").to(device)
-    compare_precision, compare_recall, compare_f1 = test_comparison(compare_model, test_loader, confidence_threshold)
+    # Train and Test individual models
+    epochs = 15
+    lightweight_model = fasterrcnn_mobilenet_v3_large_fpn(weights='DEFAULT')
+    lightweight_model = replace_box_predictor(lightweight_model, num_classes)
+    light_start = time.time()
+    lightweight_model = train_individual(lightweight_model, train_loader, epochs)
+    light_end = time.time()
+    light_minutes = (light_end - light_start) / 60
+    light_seconds = (light_end - light_start) % 60
+    print(f"Lightweight training time: {light_minutes:.0f} minutes {light_seconds:.2f} seconds")
+    test_individual(lightweight_model, test_loader, confidence_threshold, "Lightweight")
+
+    heavyweight_model = fasterrcnn_resnet50_fpn(weights='DEFAULT')
+    heavyweight_model = replace_box_predictor(heavyweight_model, num_classes)
+    heavy_start = time.time()
+    heavyweight_model = train_individual(heavyweight_model, train_loader, epochs)
+    heavy_end = time.time()
+    heavy_minutes = (heavy_end - heavy_start) / 60
+    heavy_seconds = (heavy_end - heavy_start) % 60
+    print(f"Heavyweight training time: {heavy_minutes:.0f} minutes {heavy_seconds:.2f} seconds")
+    test_individual(heavyweight_model, test_loader, confidence_threshold, "Heavyweight")
 
     end_time = time.time()
     minutes = (end_time - start_time) / 60
