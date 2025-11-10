@@ -22,6 +22,7 @@ from handling_data import (
     split_dataset,
     COCO_CLASSES
 )
+from ultralytics import YOLO
 
 '''
 This script reimplements DynamicDet, a dynamic object detection 
@@ -224,6 +225,9 @@ class DynamicDet(nn.Module):
                 score = self.router(features)
                 # print("Router output shape:", score.shape)
 
+                routing_label = routing_label.to(device)
+                score = score.to(device)
+
                 # BCE loss
                 bce = F.binary_cross_entropy(score, routing_label)
 
@@ -234,22 +238,27 @@ class DynamicDet(nn.Module):
             # print(f"Outputs: {outputs}")
             return outputs
         else:
-            # Run B1 and return
-            features = self.get_first_backbone_features(images)
-            score = self.router(features)
-            detections = []
+            self.b1.eval()
+            self.b2.eval()
+            self.router.eval()
 
-            for i, image in enumerate(images):
-                score_i = score[i].item()
-                print("Router score:", score_i)
-                if score_i < self.threshold:
-                    # Run B1 for image
-                    detection = self.b1([image])
-                    detections.append(detection[0])
-                else:
-                    # Run B2 for image
-                    detection = self.b2([image])
-                    detections.append(detection[0])
+            with torch.no_grad():
+                # Run B1 and return
+                features = self.get_first_backbone_features(images)
+                score = self.router(features)
+                detections = []
+
+                for i, image in enumerate(images):
+                    score_i = score[i].item()
+                    # print("Router score:", score_i)
+                    if score_i < self.threshold:
+                        # Run B1 for image
+                        detection = self.b1([image])
+                        detections.append(detection[0])
+                    else:
+                        # Run B2 for image
+                        detection = self.b2([image])
+                        detections.append(detection[0])
             
             return detections
 
@@ -398,7 +407,7 @@ def visualize_detections(image_tensor, detections, save_path, confidence_thresho
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-def test(model, test_loader, confidence_threshold):
+def test(model, test_loader, confidence_threshold, model_type):
     model.eval()
     correct = 0
     b1_count = 0
@@ -408,43 +417,53 @@ def test(model, test_loader, confidence_threshold):
     total_fp = 0
     total_gt = 0
     images_saved = 0
-    os.makedirs("results", exist_ok=True)
+    os.makedirs("results/dynamic", exist_ok=True)
+    os.makedirs("results/compare", exist_ok=True)
 
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(test_loader):
             images = list(image.to(device) for image in images)
 
-            # Get routing decisions
-            features = model.get_first_backbone_features(images)
-            scores = model.router(features)
+            if model_type == "dynamic":
+                # Get routing decisions
+                features = model.get_first_backbone_features(images)
+                scores = model.router(features)
 
-            routing_decisions = []
-            for score in scores:
-                total += 1
-                if score.item() < model.threshold:
-                    b1_count += 1
-                    routing_decisions.append("B1")
-                else:
-                    b2_count += 1
-                    routing_decisions.append("B2")
+                routing_decisions = []
+                for score in scores:
+                    total += 1
+                    if score.item() < model.threshold:
+                        b1_count += 1
+                        routing_decisions.append("B1")
+                    else:
+                        b2_count += 1
+                        routing_decisions.append("B2")
 
-            detections = model(images, targets=None, train_router=False)
-            print("Detection output example:", detections[0])
+                detections = model(images, targets=None, train_router=False)
+                # print("Detection output example:", detections[0])
+            else:
+                # Comparison model (YOLO)
+                detections = model(images)
 
             for img_idx, (image, detection, target, backbone) in enumerate(
                 zip(images, detections, targets, routing_decisions)
             ):
-                boxes = detection['boxes']
-                labels = detection['labels']
-                det_scores = detection['scores']
+                if hasattr(detection, "boxes"):
+                    det_boxes = detection.boxes.xyxy.to(device)
+                    det_scores = detection.boxes.conf.to(device)
+                    det_labels = detection.boxes.cls.to(torch.int64)
+                else:
+                    det_boxes = detection['boxes']
+                    det_scores = detection['scores']
+                    det_labels = detection['labels']
                 
                 gt_boxes = target['boxes']
                 gt_labels = target['labels']
                 
                 # Filter detections by confidence
                 mask = det_scores > confidence_threshold
-                boxes = boxes[mask]
-                labels = labels[mask]
+                boxes = det_boxes[mask]
+                labels = det_labels[mask]
                 det_scores = det_scores[mask]
                 
                 # Calculate metrics (simplified - matches predictions to GT by IoU)
@@ -472,10 +491,16 @@ def test(model, test_loader, confidence_threshold):
                 
                 # Save visualizations
                 if images_saved < 50:
-                    save_path = os.path.join(
-                        "results", 
-                        f'batch{batch_idx}_img{img_idx}_{backbone}.png'
-                    )
+                    if model_type == "dynamic":
+                        save_path = os.path.join(
+                            "results/dynamic", 
+                            f'batch{batch_idx}_img{img_idx}_{backbone}.png'
+                        )
+                    else:
+                        save_path = os.path.join(
+                            "results/compare", 
+                            f'batch{batch_idx}_img{img_idx}_{backbone}.png'
+                        )
                     
                     # Reconstruct detection dict for visualization
                     vis_detection = {
@@ -503,12 +528,16 @@ def test(model, test_loader, confidence_threshold):
     # Calculate metrics
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
     recall = total_tp / total_gt if total_gt > 0 else 0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    accuracy = correct / total
     
     print(f"\nDetection Metrics:")
     print(f"Precision: {precision:.3f}")
     print(f"Recall: {recall:.3f}")
-    print(f"F1 Score: {2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0:.3f}")
-    print(f"Accuracy: {correct / total}")
+    print(f"F1 Score: {f1_score:.3f}")
+    print(f"Accuracy: {accuracy}")
+
+    return precision, recall, f1_score, accuracy
 
 if __name__ == "__main__":
     start_time = time.time()
@@ -517,7 +546,7 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     # Currently using the 5k subset of COCO from Kaggle
-    subset_size = 100 # Use smaller portion
+    subset_size = 200 # Use smaller portion
     split_annotations_path = "coco/annotations/instances_train2017.json"
 
     # Split dataset into smaller train/val subsets if not already done
@@ -535,7 +564,7 @@ if __name__ == "__main__":
     # get_annotation_info(train_path)
 
     # Hyperparameters
-    batch_size = 10
+    batch_size = 2
     num_workers = 2
 
     # Train Dataset
@@ -573,17 +602,19 @@ if __name__ == "__main__":
     # Instantiate model
     model = DynamicDet(num_classes=num_classes).to(device)
 
-    backbone_epochs = 2
-    router_epochs = 2
-    confidence_threshold = 0
+    backbone_epochs = 15
+    router_epochs = 15
+    confidence_threshold = 0.1
 
     # Train and Test
 
     train_backbone_start = time.time()
     model = train_backbones(model, train_loader, backbone_epochs)
     train_backbone_end = time.time()
-    train_backbone_time = train_backbone_end - train_backbone_start
-    print(f"Backbone training time: {train_backbone_time:.2f} seconds")
+    train_backbone_minutes = (train_backbone_end - train_backbone_start) / 60
+    train_backbone_seconds = (train_backbone_end - train_backbone_start) % 60
+    print(f"Backbone training time: {train_backbone_minutes:.0f} minutes {train_backbone_seconds:.2f} seconds")
+
 
     model.b1.eval()
     model.b2.eval()
@@ -596,7 +627,11 @@ if __name__ == "__main__":
     print(f"Router training time: {train_router_minutes:.0f} minutes {train_router_seconds:.2f} seconds")
 
     model.router.eval()
-    test(model, test_loader, confidence_threshold)
+    model_precision, model_recall, model_f1, model_acc = test(model, test_loader, confidence_threshold, "dynamic")
+
+    # Compare with YOLO model
+    compare_model = YOLO("yolo11n.pt").to(device)
+    compare_precision, compare_recall, compare_f1, compare_acc = test(compare_model, test_loader, confidence_threshold, "compare")
 
     end_time = time.time()
     minutes = (end_time - start_time) / 60
