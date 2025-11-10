@@ -569,7 +569,7 @@ def train_individual(model, train_loader, epochs):
     optimizer = optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=1e-4)
 
     model.train()
-    for epoch in epochs:
+    for epoch in range(epochs):
         total_loss = 0.0
         for images, targets in train_loader:
             images = [img.to(device) for img in images]
@@ -585,7 +585,7 @@ def train_individual(model, train_loader, epochs):
 
             total_loss += losses.item()
 
-        print(f"\nEpoch [{epoch+1}/{epochs}]. Avg loss: {total_loss / len(train_loader):.4f}")
+        print(f"Epoch [{epoch+1}/{epochs}] Loss: {total_loss / len(train_loader):.4f}")
 
     print("Finished training individual model")
 
@@ -604,12 +604,11 @@ def test_individual(model, test_loader, confidence_threshold, model_type):
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(test_loader):
             images = list(image.to(device) for image in images)
-            images_np = [img.permute(1, 2, 0).cpu().numpy() for img in images]
 
             # Run individual model
             torch.cuda.synchronize()
             start = time.time()
-            detections = model(images_np)
+            detections = model(images)
             torch.cuda.synchronize()
             end = time.time()
             times.append((end - start) * 1000)
@@ -669,7 +668,7 @@ def test_individual(model, test_loader, confidence_threshold, model_type):
                 # Save visualizations
                 if images_saved < 50:
                     save_path = os.path.join(
-                        "results/compare",
+                        f"results/{model_type}",
                         f"batch{batch_idx}_img{img_idx}_{model_type}.png"
                     )
 
@@ -713,7 +712,10 @@ def test_individual(model, test_loader, confidence_threshold, model_type):
     print(f"\nMean Average Precision (mAP):")
     for k, v in metrics.items():
         if torch.is_tensor(v):
-            v = v.item()
+            if v.numel() > 1:
+                v = v.float().mean().item()
+            else:
+                v = v.item()
         print(f"{k}: {v:.4f}")
 
     return precision, recall, f1_score, metrics, avg_time, fps
@@ -785,7 +787,7 @@ if __name__ == "__main__":
     router_epochs = 10
     confidence_threshold = 0.25
 
-    # Train and Test
+    # # Train and Test
 
     train_backbone_start = time.time()
     model = train_backbones(model, train_loader, backbone_epochs)
@@ -808,21 +810,25 @@ if __name__ == "__main__":
     model_precision, model_recall, model_f1 = test(model, test_loader, confidence_threshold)
 
     # Train and Test individual models
-    epochs = 15
+    lightweight_epochs = 25
+    heavyweight_epochs = 15
+
+    print("Training Lightweight Model")
     lightweight_model = fasterrcnn_mobilenet_v3_large_fpn(weights='DEFAULT')
     lightweight_model = replace_box_predictor(lightweight_model, num_classes)
     light_start = time.time()
-    lightweight_model = train_individual(lightweight_model, train_loader, epochs)
+    lightweight_model = train_individual(lightweight_model, train_loader, lightweight_epochs)
     light_end = time.time()
     light_minutes = (light_end - light_start) / 60
     light_seconds = (light_end - light_start) % 60
     print(f"Lightweight training time: {light_minutes:.0f} minutes {light_seconds:.2f} seconds")
     test_individual(lightweight_model, test_loader, confidence_threshold, "Lightweight")
 
+    print("Training Heavyweight Model")
     heavyweight_model = fasterrcnn_resnet50_fpn(weights='DEFAULT')
     heavyweight_model = replace_box_predictor(heavyweight_model, num_classes)
     heavy_start = time.time()
-    heavyweight_model = train_individual(heavyweight_model, train_loader, epochs)
+    heavyweight_model = train_individual(heavyweight_model, train_loader, heavyweight_epochs)
     heavy_end = time.time()
     heavy_minutes = (heavy_end - heavy_start) / 60
     heavy_seconds = (heavy_end - heavy_start) % 60
