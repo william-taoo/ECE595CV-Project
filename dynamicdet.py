@@ -216,7 +216,7 @@ class DynamicDet(nn.Module):
                 per_loss_b2 = torch.stack(per_loss_b2)
 
                 # 1 means go to B2, 0 means exit
-                margin = 0.1
+                margin = 0.3
                 routing_label = (per_loss_b2 + margin < per_loss_b1).float()
                 routing_label = routing_label.view(-1, 1)
 
@@ -241,6 +241,7 @@ class DynamicDet(nn.Module):
 
             for i, image in enumerate(images):
                 score_i = score[i].item()
+                print("Router score:", score_i)
                 if score_i < self.threshold:
                     # Run B1 for image
                     detection = self.b1([image])
@@ -382,6 +383,7 @@ def visualize_detections(image_tensor, detections, save_path, confidence_thresho
                                      facecolor='none', linestyle='--')
             ax.add_patch(rect)
             
+            class_name = COCO_CLASSES.get(int(label), f'class_{label}')
             ax.text(x1, y2 + 15, f'GT: {class_name}', color='green', 
                    fontsize=9, bbox=dict(facecolor='white', alpha=0.7, edgecolor='green'))
     
@@ -493,7 +495,7 @@ def test(model, test_loader, confidence_threshold):
                         gt_labels=gt_labels
                     )
                     images_saved += 1
-                    print(f"Saved visualization: {save_path}")
+                    # print(f"Saved visualization: {save_path}")
 
     print(f"Routed to B1 (lightweight): {b1_count} ({b1_count/total:.1%})")
     print(f"Routed to B2 (heavy): {b2_count} ({b2_count/total:.1%})")
@@ -533,69 +535,70 @@ if __name__ == "__main__":
     # get_annotation_info(train_path)
 
     # Hyperparameters
-    # batch_size = 10
-    # num_workers = 2
+    batch_size = 10
+    num_workers = 2
 
-    # # Train Dataset
-    # train_root = f"coco/train2017_{subset_size}"
-    # train_annotations = train_subset_path
-    # train_dataset = CocoDataset(
-    #     root=train_root,
-    #     annotation=train_annotations,
-    #     transform=get_transform()
-    # )
-    # train_loader = DataLoader(
-    #     train_dataset,
-    #     batch_size=batch_size,
-    #     shuffle=True,
-    #     num_workers=num_workers,
-    #     collate_fn=collate_fn
-    # )
+    # Train Dataset
+    train_root = f"coco/train2017_{subset_size}"
+    train_annotations = train_subset_path
+    train_dataset = CocoDataset(
+        root=train_root,
+        annotation=train_annotations,
+        transform=get_transform()
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
 
-    # # Test dataset
-    # val_root = f"coco/val2017_{subset_size}"
-    # val_annotations = val_subset_path
-    # val_dataset = CocoDataset(
-    #     root=val_root,
-    #     annotation=val_annotations,
-    #     transform=get_transform()
-    # )
-    # test_loader = DataLoader(
-    #     val_dataset,
-    #     batch_size=batch_size,
-    #     shuffle=False,
-    #     num_workers=num_workers,
-    #     collate_fn=collate_fn
-    # )
+    # Test dataset
+    val_root = f"coco/val2017_{subset_size}"
+    val_annotations = val_subset_path
+    val_dataset = CocoDataset(
+        root=val_root,
+        annotation=val_annotations,
+        transform=get_transform()
+    )
+    test_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
 
-    # # Instantiate model
-    # model = DynamicDet(num_classes=num_classes).to(device)
+    # Instantiate model
+    model = DynamicDet(num_classes=num_classes).to(device)
 
-    # backbone_epochs = 2
-    # router_epochs = 2
-    # confidence_threshold = 0.1
+    backbone_epochs = 2
+    router_epochs = 2
+    confidence_threshold = 0
 
-    # # Train and Test
+    # Train and Test
 
-    # # train_backbone_start = time.time()
-    # # model = train_backbones(model, train_loader, backbone_epochs)
-    # # train_backbone_end = time.time()
-    # # train_backbone_time = train_backbone_end - train_backbone_start
-    # # print(f"Backbone training time: {train_backbone_time:.2f} seconds")
+    train_backbone_start = time.time()
+    model = train_backbones(model, train_loader, backbone_epochs)
+    train_backbone_end = time.time()
+    train_backbone_time = train_backbone_end - train_backbone_start
+    print(f"Backbone training time: {train_backbone_time:.2f} seconds")
 
-    # model.b1.eval()
-    # model.b2.eval()
+    model.b1.eval()
+    model.b2.eval()
 
-    # train_router_start = time.time()
-    # model = train_router(model, train_loader, router_epochs)
-    # train_router_end = time.time()
-    # train_router_minutes = (train_router_end - train_router_start) / 60
-    # train_router_seconds = (train_router_end - train_router_start) % 60
-    # print(f"Router training time: {train_router_minutes:.0f} minutes {train_router_seconds:.2f} seconds")
+    train_router_start = time.time()
+    model = train_router(model, train_loader, router_epochs)
+    train_router_end = time.time()
+    train_router_minutes = (train_router_end - train_router_start) / 60
+    train_router_seconds = (train_router_end - train_router_start) % 60
+    print(f"Router training time: {train_router_minutes:.0f} minutes {train_router_seconds:.2f} seconds")
 
-    # test(model, test_loader, confidence_threshold)
+    model.router.eval()
+    test(model, test_loader, confidence_threshold)
 
-    # end_time = time.time()
-    # minutes = (end_time - start_time) / 60
-    # seconds = (end_time - start_time) % 60
-    # print(f"Total time: {minutes:.0f} minutes {seconds:.2f} seconds")
+    end_time = time.time()
+    minutes = (end_time - start_time) / 60
+    seconds = (end_time - start_time) % 60
+    print(f"Total time: {minutes:.0f} minutes {seconds:.2f} seconds")
