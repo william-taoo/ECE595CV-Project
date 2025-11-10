@@ -155,7 +155,7 @@ class DynamicDet(nn.Module):
         # Router
         self.router = Router(in_channels=feature_size, hidden=256)
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.threshold = 0.5 # Initial threshold for router
+        self.threshold = 0.3 # Initial threshold for router
 
     def get_first_backbone_features(self, images):
         # Extract features from B1 backbone
@@ -407,7 +407,7 @@ def visualize_detections(image_tensor, detections, save_path, confidence_thresho
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
-def test(model, test_loader, confidence_threshold, model_type):
+def test(model, test_loader, confidence_threshold):
     model.eval()
     correct = 0
     b1_count = 0
@@ -418,32 +418,27 @@ def test(model, test_loader, confidence_threshold, model_type):
     total_gt = 0
     images_saved = 0
     os.makedirs("results/dynamic", exist_ok=True)
-    os.makedirs("results/compare", exist_ok=True)
 
     with torch.no_grad():
         for batch_idx, (images, targets) in enumerate(test_loader):
             images = list(image.to(device) for image in images)
 
-            if model_type == "dynamic":
-                # Get routing decisions
-                features = model.get_first_backbone_features(images)
-                scores = model.router(features)
+            # Get routing decisions
+            features = model.get_first_backbone_features(images)
+            scores = model.router(features)
 
-                routing_decisions = []
-                for score in scores:
-                    total += 1
-                    if score.item() < model.threshold:
-                        b1_count += 1
-                        routing_decisions.append("B1")
-                    else:
-                        b2_count += 1
-                        routing_decisions.append("B2")
+            routing_decisions = []
+            for score in scores:
+                total += 1
+                if score.item() < model.threshold:
+                    b1_count += 1
+                    routing_decisions.append("B1")
+                else:
+                    b2_count += 1
+                    routing_decisions.append("B2")
 
-                detections = model(images, targets=None, train_router=False)
-                # print("Detection output example:", detections[0])
-            else:
-                # Comparison model (YOLO)
-                detections = model(images)
+            detections = model(images, targets=None, train_router=False)
+            # print("Detection output example:", detections[0])
 
             for img_idx, (image, detection, target, backbone) in enumerate(
                 zip(images, detections, targets, routing_decisions)
@@ -491,16 +486,10 @@ def test(model, test_loader, confidence_threshold, model_type):
                 
                 # Save visualizations
                 if images_saved < 50:
-                    if model_type == "dynamic":
-                        save_path = os.path.join(
-                            "results/dynamic", 
-                            f'batch{batch_idx}_img{img_idx}_{backbone}.png'
-                        )
-                    else:
-                        save_path = os.path.join(
-                            "results/compare", 
-                            f'batch{batch_idx}_img{img_idx}_{backbone}.png'
-                        )
+                    save_path = os.path.join(
+                        "results/dynamic", 
+                        f'batch{batch_idx}_img{img_idx}_{backbone}.png'
+                    )
                     
                     # Reconstruct detection dict for visualization
                     vis_detection = {
@@ -529,15 +518,106 @@ def test(model, test_loader, confidence_threshold, model_type):
     precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
     recall = total_tp / total_gt if total_gt > 0 else 0
     f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    accuracy = correct / total
     
     print(f"\nDetection Metrics:")
     print(f"Precision: {precision:.3f}")
     print(f"Recall: {recall:.3f}")
     print(f"F1 Score: {f1_score:.3f}")
-    print(f"Accuracy: {accuracy}")
 
-    return precision, recall, f1_score, accuracy
+    return precision, recall, f1_score
+
+def test_comparison(model, test_loader, confidence_threshold):
+    model.eval()
+    total_tp = 0
+    total_fp = 0
+    total_gt = 0
+    images_saved = 0
+    os.makedirs("results/compare", exist_ok=True)
+
+    with torch.no_grad():
+        for batch_idx, (images, targets) in enumerate(test_loader):
+            images = list(image.to(device) for image in images)
+
+            # Run YOLO inference
+            detections = model(images)
+
+            # Convert YOLO output to consistent dict format
+            for img_idx, (image, detection, target) in enumerate(zip(images, detections, targets)):
+                if hasattr(detection, "boxes"):
+                    det_boxes = detection.boxes.xyxy.to(device)
+                    det_scores = detection.boxes.conf.to(device)
+                    det_labels = detection.boxes.cls.to(torch.int64)
+                else:
+                    det_boxes = detection['boxes']
+                    det_scores = detection['scores']
+                    det_labels = detection['labels']
+
+                gt_boxes = target['boxes'].to(device)
+                gt_labels = target['labels'].to(device)
+
+                # Filter detections by confidence
+                mask = det_scores > confidence_threshold
+                det_boxes = det_boxes[mask]
+                det_labels = det_labels[mask]
+                det_scores = det_scores[mask]
+
+                # Calculate metrics (IoU-based)
+                matched_gt = set()
+                for pred_box, pred_label in zip(det_boxes, det_labels):
+                    best_iou = 0
+                    best_gt_idx = -1
+
+                    for gt_idx, (gt_box, gt_label) in enumerate(zip(gt_boxes, gt_labels)):
+                        if gt_label == pred_label:
+                            iou = compute_iou(pred_box, gt_box)
+                            if iou > best_iou:
+                                best_iou = iou
+                                best_gt_idx = gt_idx
+
+                    if best_iou > 0.5 and best_gt_idx not in matched_gt:
+                        total_tp += 1
+                        matched_gt.add(best_gt_idx)
+                    else:
+                        total_fp += 1
+
+                total_gt += len(gt_boxes)
+
+                # Save visualizations
+                if images_saved < 50:
+                    save_path = os.path.join(
+                        "results/compare",
+                        f"batch{batch_idx}_img{img_idx}_YOLO.png"
+                    )
+
+                    vis_detection = {
+                        'boxes': det_boxes,
+                        'labels': det_labels,
+                        'scores': det_scores
+                    }
+
+                    visualize_detections(
+                        image,
+                        vis_detection,
+                        save_path,
+                        confidence_threshold=confidence_threshold,
+                        backbone_used="YOLO",
+                        show_gt=True,
+                        gt_boxes=gt_boxes,
+                        gt_labels=gt_labels
+                    )
+                    images_saved += 1
+
+    # Compute metrics
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    recall = total_tp / total_gt if total_gt > 0 else 0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    print(f"\nYOLO Detection Metrics:")
+    print(f"Precision: {precision:.3f}")
+    print(f"Recall: {recall:.3f}")
+    print(f"F1 Score: {f1_score:.3f}")
+
+    return precision, recall, f1_score
 
 if __name__ == "__main__":
     start_time = time.time()
@@ -602,8 +682,8 @@ if __name__ == "__main__":
     # Instantiate model
     model = DynamicDet(num_classes=num_classes).to(device)
 
-    backbone_epochs = 15
-    router_epochs = 15
+    backbone_epochs = 20
+    router_epochs = 10
     confidence_threshold = 0.1
 
     # Train and Test
@@ -614,7 +694,6 @@ if __name__ == "__main__":
     train_backbone_minutes = (train_backbone_end - train_backbone_start) / 60
     train_backbone_seconds = (train_backbone_end - train_backbone_start) % 60
     print(f"Backbone training time: {train_backbone_minutes:.0f} minutes {train_backbone_seconds:.2f} seconds")
-
 
     model.b1.eval()
     model.b2.eval()
@@ -627,11 +706,11 @@ if __name__ == "__main__":
     print(f"Router training time: {train_router_minutes:.0f} minutes {train_router_seconds:.2f} seconds")
 
     model.router.eval()
-    model_precision, model_recall, model_f1, model_acc = test(model, test_loader, confidence_threshold, "dynamic")
+    model_precision, model_recall, model_f1 = test(model, test_loader, confidence_threshold)
 
     # Compare with YOLO model
     compare_model = YOLO("yolo11n.pt").to(device)
-    compare_precision, compare_recall, compare_f1, compare_acc = test(compare_model, test_loader, confidence_threshold, "compare")
+    compare_precision, compare_recall, compare_f1 = test_comparison(compare_model, test_loader, confidence_threshold)
 
     end_time = time.time()
     minutes = (end_time - start_time) / 60
