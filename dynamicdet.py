@@ -546,20 +546,24 @@ def test(model, test_loader, confidence_threshold):
     print(f"Recall: {recall:.3f}")
     print(f"F1 Score: {f1_score:.3f}")
 
+    avg_time = np.mean(times)
+    p95_time = np.percentile(times, 95)
+    fps = 1000 / avg_time
+    print(f"\nInference Speed:")
+    print(f"Average inference time: {avg_time:.2f} ms/image")
+    print(f"95th percentile latency: {p95_time:.2f} ms")
+    print(f"FPS: {fps:.2f}")
+
     # Compute mAP metrics
     map_results = ap_metric.compute()
     print("\nmAP Results:")
     for k, v in map_results.items():
         if torch.is_tensor(v):
-            v = v.item()
+            if v.numel() > 1:
+                v = v.float().mean().item()
+            else:
+                v = v.item()
         print(f"{k}: {v:.4f}")
-
-    avg_time = np.mean(times)
-    p95_time = np.percentile(times, 95)
-    fps = 1000 / avg_time
-    print(f"Average inference time: {avg_time:.2f} ms/image")
-    print(f"95th percentile latency: {p95_time:.2f} ms")
-    print(f"FPS: {fps:.2f}")
 
     return precision, recall, f1_score, avg_time, p95_time, fps
 
@@ -727,7 +731,7 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     # Currently using the 5k subset of COCO from Kaggle
-    subset_size = 200 # Use smaller portion
+    subset_size = 500 # Use smaller portion
     split_annotations_path = "coco/annotations/instances_train2017.json"
 
     # Split dataset into smaller train/val subsets if not already done
@@ -783,8 +787,8 @@ if __name__ == "__main__":
     # Instantiate model
     model = DynamicDet(num_classes=num_classes).to(device)
 
-    backbone_epochs = 20
-    router_epochs = 10
+    backbone_epochs = 50
+    router_epochs = 50
     confidence_threshold = 0.25
 
     # # Train and Test
@@ -807,11 +811,11 @@ if __name__ == "__main__":
     print(f"Router training time: {train_router_minutes:.0f} minutes {train_router_seconds:.2f} seconds")
 
     model.router.eval()
-    model_precision, model_recall, model_f1 = test(model, test_loader, confidence_threshold)
+    model_precision, model_recall, model_f1, model_avg_time, model_p95_time, model_fps = test(model, test_loader, confidence_threshold)
 
     # Train and Test individual models
-    lightweight_epochs = 25
-    heavyweight_epochs = 15
+    lightweight_epochs = 50
+    heavyweight_epochs = 50
 
     print("Training Lightweight Model")
     lightweight_model = fasterrcnn_mobilenet_v3_large_fpn(weights='DEFAULT')
@@ -822,7 +826,7 @@ if __name__ == "__main__":
     light_minutes = (light_end - light_start) / 60
     light_seconds = (light_end - light_start) % 60
     print(f"Lightweight training time: {light_minutes:.0f} minutes {light_seconds:.2f} seconds")
-    test_individual(lightweight_model, test_loader, confidence_threshold, "Lightweight")
+    light_precision, light_recall, light_f1, light_avg_time, light_p95_time, light_fps = test_individual(lightweight_model, test_loader, confidence_threshold, "Lightweight")
 
     print("Training Heavyweight Model")
     heavyweight_model = fasterrcnn_resnet50_fpn(weights='DEFAULT')
@@ -833,7 +837,7 @@ if __name__ == "__main__":
     heavy_minutes = (heavy_end - heavy_start) / 60
     heavy_seconds = (heavy_end - heavy_start) % 60
     print(f"Heavyweight training time: {heavy_minutes:.0f} minutes {heavy_seconds:.2f} seconds")
-    test_individual(heavyweight_model, test_loader, confidence_threshold, "Heavyweight")
+    heavy_precision, heavy_recall, heavy_f1, heavy_avg_time, heavy_p95_time, heavy_fps = test_individual(heavyweight_model, test_loader, confidence_threshold, "Heavyweight")
 
     end_time = time.time()
     minutes = (end_time - start_time) / 60
